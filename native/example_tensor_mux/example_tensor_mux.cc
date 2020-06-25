@@ -27,10 +27,13 @@
 #include <gst/gst.h>
 #include <gst/app/app.h>
 #include <nnstreamer/tensor_filter_custom_easy.h>
+#include <nnstreamer/nnstreamer_plugin_api.h>
 
 #define MODE_1 '1'
 #define MODE_2 '2'
 #define MODE_3 '3'
+
+#define TENSORS 1
 
 /**
  * @brief Macro for debug mode.
@@ -138,6 +141,10 @@ push_app_src (app_data_s * app)
 {
   GstBuffer *buf;
   guint8 *data_arr;
+#if TENSORS
+  guint8 *data_arr_1;
+  GstMemory *mem;
+#endif
 
   data_arr = g_new0 (guint8, sizeof (guint8));
   g_assert (data_arr);
@@ -146,6 +153,16 @@ push_app_src (app_data_s * app)
   buf = gst_buffer_new_wrapped (data_arr, sizeof (guint8));
   g_assert (buf);
 
+#if TENSORS
+  data_arr_1 = g_new0 (guint8, sizeof (guint8));
+  g_assert (data_arr_1);
+  data_arr_1[0] = 5;
+  mem = gst_memory_new_wrapped (GST_MEMORY_FLAG_READONLY,
+        data_arr_1, sizeof (guint8), 0, sizeof (guint8), data_arr_1, g_free);
+
+  gst_buffer_append_memory (buf, mem);
+#endif
+  
   g_message ("[%s] push %d tensor(s)", __FUNCTION__, gst_buffer_n_memory (buf));
   g_assert (gst_app_src_push_buffer (GST_APP_SRC (app->src),
           buf) == GST_FLOW_OK);
@@ -176,7 +193,12 @@ int out_1 = 10;
 static int function_1 (void *data, const GstTensorFilterProperties *prop,
     const GstTensorMemory *in, GstTensorMemory *out)
 {
+  _print_log ("input: %d", ( (guint8*)in[0].data)[0]);
+#if TENSORS
+  _print_log ("input: %d", ( (guint8*)in[1].data)[0]);
+#endif
   ( (guint8*)out[0].data)[0] = out_1++;
+  ( (guint8*)out[1].data)[0] = out_1++;
   return 0;
 }
 
@@ -188,19 +210,25 @@ static int function_2 (void *data, const GstTensorFilterProperties *prop,
   switch (TEST_MODE) {
     case MODE_1:
       ( (guint8*) out[0].data)[0] = 100;
+      ( (guint8*) out[1].data)[0] = 101;
       ret = 0;
       break;
     case MODE_2:
       /* push no data */
       ( (guint8*) out[0].data)[0] = 150;
-      if (is_sent)
+      ( (guint8*) out[1].data)[0] = 151;
+      if (is_sent) {
         /* send data just once */
+        _print_log ("Don't send at second");
         ret = 1;
-      else
+      }
+      else {
         ret = 0;
+      }
       break;
     case MODE_3:
       ( (guint8*) out[0].data)[0] = 200;
+      ( (guint8*) out[1].data)[0] = 201;
       g_message ("wait for 3 seconds at model2");
       g_usleep (1000000);
       g_message ("1");
@@ -228,6 +256,10 @@ main (int argc, char **argv)
   app_data_s *app;
   gchar *pipeline;
   gchar *sync_mode;
+#if TENSORS
+  GstTensorsConfig config;
+  GstCaps *caps;
+#endif
   
   if (argv[1] == NULL){
     g_critical ("please input the TEST MODE: 1-3. e.g. nnstreamer_example_tensor_mux 1");
@@ -262,21 +294,41 @@ main (int argc, char **argv)
   pipeline =
       g_strdup_printf (
         "tensor_mux name=mux sync_mode=%s silent=false ! tensor_sink name=sink "
-
-        "appsrc name=appsrc caps=other/tensor,dimension=(string)1:1:1:1,type=(string)uint8,framerate=(fraction)0/1 ! "
+        "appsrc name=appsrc "
+#if TENSORS
+        "! other/tensors ! "
+#else
+        "caps=other/tensor,dimension=(string)1:1:1:1,type=(string)uint8,framerate=(fraction)0/1 ! "
+#endif
         "tee name=t "
-          "t. ! queue ! tensor_filter framework=custom-easy model=model1 ! queue ! mux.sink_0 "
-          "t. ! queue ! tensor_filter framework=custom-easy model=model2 ! queue ! mux.sink_1 "
+          "t. ! queue ! tensor_filter name=filter1 silent=false framework=custom-easy model=model1 ! mux.sink_0 "
+          "t. ! queue ! tensor_filter name=filter2 framework=custom-easy model=model2 ! mux.sink_1 "
         , sync_mode);
 
  /* setting tensor_filter custom-easy */
+
+#if TENSORS
+  const GstTensorsInfo info_in = {
+    .num_tensors = 2U,
+    .info = {
+      { .name = NULL, .type = _NNS_UINT8, .dimension = { 1, 1, 1, 1}},
+      { .name = NULL, .type = _NNS_UINT8, .dimension = { 1, 1, 1, 1}}
+    },
+  };
+#else
   const GstTensorsInfo info_in = {
     .num_tensors = 1U,
-    .info = {{ .name = NULL, .type = _NNS_UINT8, .dimension = { 1, 1, 1, 1}}},
+    .info = {
+      { .name = NULL, .type = _NNS_UINT8, .dimension = { 1, 1, 1, 1}}
+    },
   };
+#endif
   const GstTensorsInfo info_out = {
-    .num_tensors = 1U,
-    .info = {{ .name = NULL, .type = _NNS_UINT8, .dimension = { 1, 1, 1, 1}}},
+    .num_tensors = 2U,
+    .info = {
+      { .name = NULL, .type = _NNS_UINT8, .dimension = { 1, 1, 1, 1}},
+      { .name = NULL, .type = _NNS_UINT8, .dimension = { 1, 1, 1, 1}}
+    },
   };
 
   NNS_custom_easy_register ("model1", function_1,
@@ -308,6 +360,15 @@ main (int argc, char **argv)
   app->src = gst_bin_get_by_name (GST_BIN (app->pipeline), "appsrc");
   g_assert (app->src);
 
+#if TENSORS
+  config.info = info_in;
+  config.rate_d = 1;
+  config.rate_n = 0;
+  caps = gst_tensors_caps_from_config (&config);
+  gst_app_src_set_caps (GST_APP_SRC (app->src), caps);
+  gst_caps_unref (caps);
+#endif
+
   /* Start playing */
   gst_element_set_state (app->pipeline, GST_STATE_PLAYING);
   /* ready to get input sentence */
@@ -318,6 +379,8 @@ main (int argc, char **argv)
 
   /* push once more at MODE_2 */
   if (TEST_MODE == MODE_2) {
+    g_usleep (10000);
+    push_app_src (app);
     g_usleep (10000);
     push_app_src (app);
   }
@@ -344,6 +407,7 @@ main (int argc, char **argv)
   NNS_custom_easy_unregister ("model2");
   gst_bus_remove_signal_watch (app->bus);
   gst_object_unref (app->bus);
+  gst_object_unref (app->src);
   gst_object_unref (app->pipeline);
 
   g_free (app);
